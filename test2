@@ -1,0 +1,212 @@
+import os
+import fitz  # PyMuPDF
+import pandas as pd
+import xml.etree.ElementTree as ET
+import pyreadstat
+import zipfile
+from flask import Flask, request, render_template, send_file, jsonify
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+UPLOAD_FOLDER = 'uploads'
+OUTPUT_FOLDER = 'outputs'
+ALLOWED_EXTENSIONS = {'pdf', 'csv', 'xml', 'xpt', 'zip'}
+
+# Ensure upload and output directories exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ---------------- File Processing Functions ----------------
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def replace_text_in_pdf(input_pdf_path, old_text, new_text, output_path):
+    """Replace text in PDF file and save to specified output_path"""
+    pdf_document = fitz.open(input_pdf_path)
+    font_name = "Times-Roman"
+    
+    for page in pdf_document:
+        text_instances = page.search_for(old_text)
+        if text_instances:
+            original_text_info = page.get_text("dict")['blocks']
+            
+            for rect in text_instances:
+                page.add_redact_annot(rect)
+            page.apply_redactions()
+            
+            for rect in text_instances:
+                original_fontsize = 12
+                for block in original_text_info:
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            if old_text in span["text"]:
+                                original_fontsize = span["size"]
+                                break
+                        else:
+                            continue
+                        break
+                    else:
+                        continue
+                    break
+                
+                font_params = {
+                    'fontsize': original_fontsize,
+                    'fontname': font_name
+                }
+                insert_point = fitz.Point(rect.x0, rect.y1 - 2.5)
+                page.insert_text(insert_point, new_text, **font_params)
+    
+    pdf_document.save(output_path)
+    pdf_document.close()
+    return output_path
+
+def replace_text_in_csv(input_csv_path, old_text, new_text, output_path):
+    """Replace text in CSV file and save to specified output_path"""
+    df = pd.read_csv(input_csv_path, dtype=str)
+    df = df.applymap(lambda x: x.replace(old_text, new_text) if isinstance(x, str) else x)
+    df.to_csv(output_path, index=False)
+    return output_path
+
+def replace_text_in_xml(input_xml_path, old_text, new_text, output_path):
+    """Replace text in XML file and save to specified output_path"""
+    tree = ET.parse(input_xml_path)
+    root = tree.getroot()
+    
+    def replace_in_element(elem):
+        if elem.text and old_text in elem.text:
+            elem.text = elem.text.replace(old_text, new_text)
+        if elem.tail and old_text in elem.tail:
+            elem.tail = elem.tail.replace(old_text, new_text)
+        for k, v in elem.attrib.items():
+            if old_text in v:
+                elem.attrib[k] = v.replace(old_text, new_text)
+        for child in elem:
+            replace_in_element(child)
+    
+    replace_in_element(root)
+    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    return output_path
+
+def replace_text_in_xpt(input_xpt_path, old_text, new_text, output_path):
+    """Replace text in XPT file and save to specified output_path"""
+    df, meta = pyreadstat.read_xport(input_xpt_path)
+    df = df.applymap(lambda x: x.replace(old_text, new_text) if isinstance(x, str) else x)
+    pyreadstat.write_xport(df, output_path, file_format_version=8, table_name=meta.table_name)
+    return output_path
+
+def process_single_file(file_path, old_text, new_text, output_path=None):
+    """Process a single file based on its extension"""
+    if output_path is None:
+        base, ext = os.path.splitext(file_path)
+        output_path = f"{base}_modified{ext}"
+    
+    ext = os.path.splitext(file_path)[1].lower()
+    
+    if ext == '.pdf':
+        return replace_text_in_pdf(file_path, old_text, new_text, output_path)
+    elif ext == '.csv':
+        return replace_text_in_csv(file_path, old_text, new_text, output_path)
+    elif ext == '.xml':
+        return replace_text_in_xml(file_path, old_text, new_text, output_path)
+    elif ext == '.xpt':
+        return replace_text_in_xpt(file_path, old_text, new_text, output_path)
+    else:
+        return None
+
+def extract_zip_and_process(zip_path, old_text, new_text):
+    """Extract ZIP file and process all supported files inside, preserving structure, and save modified zip"""
+    base_zip = os.path.splitext(os.path.basename(zip_path))[0]
+    extract_folder = os.path.join(OUTPUT_FOLDER, base_zip + "_extracted")
+    modified_folder = os.path.join(OUTPUT_FOLDER, base_zip + "_modified")
+    os.makedirs(extract_folder, exist_ok=True)
+    os.makedirs(modified_folder, exist_ok=True)
+    
+    processed_files = []
+    supported_extensions = ['.pdf', '.csv', '.xml', '.xpt']
+    
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_folder)
+    
+    for root, dirs, files in os.walk(extract_folder):
+        for file in files:
+            file_path = os.path.join(root, file)
+            ext = os.path.splitext(file)[1].lower()
+            
+            if ext in supported_extensions:
+                rel_path = os.path.relpath(file_path, extract_folder)
+                base, ext = os.path.splitext(rel_path)
+                modified_rel_path = base + "_modified" + ext
+                modified_path = os.path.join(modified_folder, modified_rel_path)
+                os.makedirs(os.path.dirname(modified_path), exist_ok=True)
+                try:
+                    output = process_single_file(file_path, old_text, new_text, modified_path)
+                    if output:
+                        processed_files.append(output)
+                except Exception as e:
+                    print(f"Error processing {file}: {str(e)}")
+                    continue
+    
+    if processed_files:
+        output_zip = os.path.join(OUTPUT_FOLDER, base_zip + "_modified.zip")
+        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
+            for processed_file in processed_files:
+                arcname = os.path.relpath(processed_file, modified_folder)
+                zip_ref.write(processed_file, arcname)
+        return output_zip
+    else:
+        return None
+
+# ---------------- Flask Routes ----------------
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/process_file', methods=['POST'])
+def process_file():
+    if not request.files.getlist('file') or not request.form.get('old_text') or not request.form.get('new_text'):
+        return jsonify({'error': 'Missing file(s) or text parameters'}), 400
+    
+    files = request.files.getlist('file')
+    old_text = request.form['old_text']
+    new_text = request.form['new_text']
+    
+    processed_outputs = []
+    
+    for file in files:
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(UPLOAD_FOLDER, filename)
+            file.save(file_path)
+            
+            try:
+                if filename.lower().endswith('.zip'):
+                    output = extract_zip_and_process(file_path, old_text, new_text)
+                else:
+                    base = os.path.splitext(filename)[0]
+                    ext = os.path.splitext(filename)[1]
+                    out_filename = base + '_modified' + ext
+                    output_path = os.path.join(OUTPUT_FOLDER, out_filename)
+                    output = process_single_file(file_path, old_text, new_text, output_path)
+                
+                if output:
+                    processed_outputs.append(output)
+            except Exception as e:
+                print(f"Error processing {filename}: {str(e)}")
+                continue
+    
+    if not processed_outputs:
+        return jsonify({'error': 'No supported files processed'}), 400
+    
+    if len(processed_outputs) == 1:
+        return send_file(processed_outputs[0], as_attachment=True, download_name=os.path.basename(processed_outputs[0]))
+    else:
+        zip_path = os.path.join(OUTPUT_FOLDER, 'processed_files.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
+            for out in processed_outputs:
+                zip_ref.write(out, os.path.basename(out))
+        return send_file(zip_path, as_attachment=True, download_name='processed_files.zip')
+
+if __name__ == '__main__':
+    app.run(debug=True)
