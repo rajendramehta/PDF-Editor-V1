@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Text Replacer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        input[type="text"], input[type="file"] {
+            margin: 10px 0;
+            padding: 8px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        #status {
+            margin-top: 20px;
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>File Text Replacer</h2>
+        <form id="uploadForm" enctype="multipart/form-data">
+            <label for="file">Select File(s) (PDF, CSV, XML, XPT, or ZIP). For entire folders, zip them first and upload the ZIP:</label>
+            <input type="file" id="file" name="file" accept=".pdf,.csv,.xml,.xpt,.zip" multiple required>
+            
+            <label for="old_text">Text to Replace:</label>
+            <input type="text" id="old_text" name="old_text" required>
+            
+            <label for="new_text">New Text:</label>
+            <input type="text" id="new_text" name="new_text" required>
+            
+            <button type="submit">Process File(s)</button>
+        </form>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const status = document.getElementById('status');
+            
+            status.textContent = 'Processing...';
+            
+            try {
+                const response = await fetch('/api/process_file', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (response.ok) {
+                    const blob = await response.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    const contentDisposition = response.headers.get('Content-Disposition');
+                    let filename = 'processed_file';
+                    if (contentDisposition) {
+                        const filenameMatch = contentDisposition.match(/filename="?(.+)"?/i);
+                        if (filenameMatch) filename = filenameMatch[1];
+                    }
+                    a.download = filename;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    window.URL.revokeObjectURL(url);
+                    status.textContent = 'File(s) processed successfully!';
+                } else {
+                    const error = await response.json();
+                    status.textContent = `Error: ${error.error}`;
+                }
+            } catch (error) {
+                status.textContent = `Error: ${error.message}`;
+            }
+        });
+    </script>
+</body>
+</html>
